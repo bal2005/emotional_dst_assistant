@@ -53,14 +53,40 @@ def insert_utterance(text: str, vad: Dict[str, float], confidence: float,
                      method: str, extra: Optional[Dict]=None, db_path: str = DB_PATH):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    ts = datetime.now(timezone.utc).isoformat()
 
+    # Ensure tables exist (idempotent)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS utterances (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        valence REAL,
+        arousal REAL,
+        dominance REAL,
+        confidence REAL,
+        method TEXT,
+        extra_json TEXT,
+        ts TEXT
+    );
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS running_state (
+        key TEXT PRIMARY KEY,
+        valence REAL,
+        arousal REAL,
+        dominance REAL,
+        last_updated TEXT
+    );
+    """)
+
+    ts = datetime.now(timezone.utc).isoformat()
     c.execute("""
     INSERT INTO utterances (text, valence, arousal, dominance, confidence, method, extra_json, ts)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (text, vad["valence"], vad["arousal"], vad["dominance"],
           confidence, method, json.dumps(extra or {}), ts))
-    conn.commit(); conn.close()
+
+    conn.commit()
+    conn.close()
 
 def get_running_state(key="user_current", db_path: str = DB_PATH) -> Optional[Dict]:
     conn = sqlite3.connect(db_path)
@@ -297,6 +323,7 @@ def ema_update(prev: Optional[Dict[str,float]], curr: Dict[str,float], alpha=DEF
 
 # ---------- PROCESS ----------
 def process_utterance(text: str, alpha=DEFAULT_ALPHA, maintain_state=True):
+    init_db(DB_PATH)
     vad1, vad2, merged, infos = compute_vad_hybrid(text)
 
     insert_utterance(text, vad1, 0.7, "MWE+Unigram", infos["mwe_info"])

@@ -313,14 +313,13 @@ def llm_recommendation_response(emotion: str, slots: Dict, recs: List[Dict]) -> 
     Generates a natural assistant reply using retrieved Neo4j records.
     Returns a plain string (safe even if model adds extra junk).
     """
-    # Keep prompt short + structured to reduce hallucination
     recs_compact = []
     for r in recs:
         recs_compact.append({
             "place": r.get("place"),
             "area": r.get("area"),
             "activity": r.get("activity"),
-            "remedies": r.get("remedies", [])[:3],  # keep small
+            "remedies": r.get("remedies", [])[:3],
             "why": r.get("why", [])[:3]
         })
 
@@ -363,7 +362,6 @@ Return ONLY JSON:
         if isinstance(reply, str) and reply.strip():
             return reply.strip()
 
-        # fallback: show compact deterministic message
         return deterministic_reply(emotion, recs)
 
     except Exception as e:
@@ -394,6 +392,29 @@ def deterministic_reply(emotion: str, recs: List[Dict]) -> str:
 def get_missing_slots(slots: Dict) -> List[str]:
     return [s for s in MANDATORY_SLOTS if s not in slots]
 
+# ================== STATE RESET AFTER FINAL RECOMMENDATION ==================
+def reset_after_recommendation_keep_history():
+    """
+    Option A — Keep history (recommended)
+
+    Keep:
+    - history
+    - running_vad
+
+    Reset:
+    - slots
+    - preferences_asked
+
+    Why:
+    - better emotion continuity
+    - better preference extraction
+    - more natural conversation
+    """
+    conversation_state["slots"] = {}
+    conversation_state["preferences_asked"] = False
+    # conversation_state["history"] = []   ❌ don't reset
+    # conversation_state["running_vad"] = None   ❌ don't reset
+
 # ================== MAIN TURN HANDLER ==================
 async def process_turn(user_text: str) -> Dict:
     conversation_state["history"].append(user_text)
@@ -411,6 +432,8 @@ async def process_turn(user_text: str) -> Dict:
                 alpha * dst_result["merged"][k]
                 + (1 - alpha) * conversation_state["running_vad"][k]
             )
+        # keep emotion updated for the new trace as well
+        conversation_state["slots"]["Emotion"] = dst_result["mapped_emotion"]
 
     # -------- STEP 2: SLOT EXTRACTION (NO EMOTION OVERRIDE) --------
     extracted_slots = await asyncio.to_thread(extract_slots_from_text, user_text)
@@ -448,6 +471,7 @@ async def process_turn(user_text: str) -> Dict:
     recommendations = await neo4j_recommend(conversation_state["slots"])
 
     emotion = conversation_state["slots"].get("Emotion", "stressed")
+
     # -------- STEP 6: LLM Response from retrieved records --------
     chat_response = await asyncio.to_thread(
         llm_recommendation_response,
@@ -456,14 +480,19 @@ async def process_turn(user_text: str) -> Dict:
         recommendations
     )
 
-    return {
+    final_output = {
         "type": "final",
         "emotion": emotion,
         "running_vad": conversation_state["running_vad"],
-        "slots": conversation_state["slots"],
+        "slots": dict(conversation_state["slots"]),
         "recommendations": recommendations,
-        "reply": chat_response  # ✅ natural chat response
+        "reply": chat_response
     }
+
+    # -------- STEP 7: RESET FOR NEXT TRACE (KEEP HISTORY) --------
+    reset_after_recommendation_keep_history()
+
+    return final_output
 
 # ================== INTERACTIVE LOOP ==================
 if __name__ == "__main__":
@@ -481,9 +510,7 @@ if __name__ == "__main__":
 
         output = asyncio.run(process_turn(user_input))
 
-        # If final, print the friendly reply first
         if output.get("type") == "final" and output.get("reply"):
             print("\nAssistant:\n" + output["reply"] + "\n")
 
-        # Always print debug JSON (optional)
         print(json.dumps(output, indent=2, ensure_ascii=False))

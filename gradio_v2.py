@@ -23,13 +23,13 @@ def format_assistant_message(result: dict) -> str:
     t = result.get("type")
 
     if t == "clarification":
-        return f"❓ {result.get('question', 'Could you clarify?')}"
+        return f" {result.get('question', 'Could you clarify?')}"
 
     if t == "preferences":
-        return f"🧩 {result.get('question', 'Any preferences?')}"
+        return f" {result.get('question', 'Any preferences?')}"
 
     if t == "final":
-        # ✅ Use LLM-generated grounded response if available
+        # Use LLM-generated grounded response if available
         reply = result.get("reply")
         if isinstance(reply, str) and reply.strip():
             return reply.strip()
@@ -44,7 +44,7 @@ def format_assistant_message(result: dict) -> str:
 
         return "I couldn't find recommendations yet. Want to try a different place/activity?"
 
-    return "⚠️ Something went wrong."
+    return " Something went wrong."
 
 
 def extract_debug_fields(result: dict, state: dict):
@@ -147,7 +147,7 @@ def chat_handler(user_text, history, state):
 
 def on_reset():
     state = reset_conversation_state()
-    history = [{"role": "assistant", "content": "✅ Reset done. Tell me how you're feeling."}]
+    history = [{"role": "assistant", "content": " Reset done. Tell me how you're feeling."}]
     return (
         history,
         state,
@@ -158,7 +158,7 @@ def on_reset():
 
 
 with gr.Blocks() as demo:
-    gr.Markdown("## 🧠 Emotional Wellness Assistant 🌱")
+    gr.Markdown("##  Emotional Wellness Assistant 🌱")
 
     state = gr.State(reset_conversation_state())
 
@@ -170,13 +170,13 @@ with gr.Blocks() as demo:
                 reset_btn = gr.Button("Reset")
 
         with gr.Column(scale=1):
-            gr.Markdown("### 🧩 Extracted Slots")
+            gr.Markdown("###  Extracted Slots")
             slots_box = gr.Code(value="{}", language="json", lines=12)
 
-            gr.Markdown("### 📊 Running VAD")
+            gr.Markdown("###  Running VAD")
             vad_box = gr.Code(value="{}", language="json", lines=8)
 
-            gr.Markdown("### 📍 Top-3 Recommendations (Raw)")
+            gr.Markdown("###  Top-3 Recommendations (Raw)")
             recs_box = gr.Code(value="[]", language="json", lines=12)
 
     txt.submit(

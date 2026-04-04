@@ -11,7 +11,7 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
 # ===== Optional: LLM Config (Gemini) =====
 import google.generativeai as genai
-GEMINI_KEY = "AIzaSyB7gKTnDrD4kcjnGbCI72RQbgaioYYMUh0"
+GEMINI_KEY = "*****************"
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 

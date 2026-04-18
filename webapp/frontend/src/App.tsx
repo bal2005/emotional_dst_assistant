@@ -7,6 +7,7 @@ import AlphaSlider from "./components/AlphaSlider";
 
 export type Message = { role: "user" | "assistant"; text: string };
 export type Slots = Record<string, string>;
+export type SlotStatus = Record<string, "known" | "unsure">;
 export type Vad = { valence?: number; arousal?: number; dominance?: number };
 export type Recommendation = {
   place: string;
@@ -26,6 +27,7 @@ export default function App() {
     { role: "assistant", text: "Hi there 🌱 Tell me how you're feeling today." },
   ]);
   const [slots, setSlots] = useState<Slots>({});
+  const [slotStatus, setSlotStatus] = useState<SlotStatus>({});
   const [vad, setVad] = useState<Vad>({});
   const [recs, setRecs] = useState<Recommendation[]>([]);
   const [loading, setLoading] = useState(false);
@@ -53,6 +55,7 @@ export default function App() {
         if (data.slots || data.slots_collected) {
           setSlots(data.slots || data.slots_collected || {});
         }
+        if (data.slot_status) setSlotStatus(data.slot_status);
         if (data.running_vad) setVad(data.running_vad);
         if (data.recommendations) setRecs(data.recommendations);
       } catch {
@@ -80,6 +83,7 @@ export default function App() {
           { role: "assistant", text: "Hi there 🌱 Tell me how you're feeling today." },
         ]);
         setSlots({});
+        setSlotStatus({});
         setVad({});
         setRecs([]);
       }
@@ -88,6 +92,7 @@ export default function App() {
         { role: "assistant", text: "Hi there 🌱 Tell me how you're feeling today." },
       ]);
       setSlots({});
+      setSlotStatus({});
       setVad({});
       setRecs([]);
     } finally {
@@ -125,7 +130,7 @@ export default function App() {
         </div>
         <div style={styles.right}>
           <AlphaSlider alpha={alpha} onChange={handleAlphaChange} />
-          <SlotsPanel slots={slots} />
+          <SlotsPanel slots={slots} slotStatus={slotStatus} />
           <VadPanel vad={vad} />
           <RecsPanel recs={recs} />
         </div>

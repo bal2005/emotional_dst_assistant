@@ -1,4 +1,9 @@
-import type { Slots } from "../App";
+import type { Slots, SlotStatus } from "../App";
+
+interface Props {
+  slots: Slots;
+  slotStatus: SlotStatus;
+}
 
 const SLOT_ICONS: Record<string, string> = {
   Emotion: "💭",
@@ -18,7 +23,7 @@ const SLOT_COLORS: Record<string, string> = {
   Remedy: "#fefcbf",
 };
 
-export default function SlotsPanel({ slots }: { slots: Slots }) {
+export default function SlotsPanel({ slots, slotStatus }: Props) {
   const entries = Object.entries(slots).filter(([, v]) => v);
 
   return (
@@ -30,15 +35,39 @@ export default function SlotsPanel({ slots }: { slots: Slots }) {
         <p style={styles.empty}>No slots collected yet.</p>
       ) : (
         <div style={styles.grid}>
-          {entries.map(([key, val]) => (
-            <div key={key} style={{ ...styles.chip, background: SLOT_COLORS[key] || "#edf2f7" }}>
-              <span style={styles.chipIcon}>{SLOT_ICONS[key] || "•"}</span>
-              <div>
-                <div style={styles.chipKey}>{key}</div>
-                <div style={styles.chipVal}>{val}</div>
+          {entries.map(([key, val]) => {
+            const status = slotStatus[key];
+            const isUnsure = val === "unsure" || status === "unsure";
+            return (
+              <div
+                key={key}
+                style={{
+                  ...styles.chip,
+                  background: isUnsure ? "#fff5f5" : (SLOT_COLORS[key] || "#edf2f7"),
+                  border: isUnsure ? "1px dashed #fc8181" : "1px solid transparent",
+                  opacity: isUnsure ? 0.85 : 1,
+                }}
+              >
+                <span style={styles.chipIcon}>{SLOT_ICONS[key] || "•"}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={styles.chipKey}>{key}</div>
+                  <div style={styles.chipVal}>
+                    {isUnsure ? <em style={{ color: "#a0aec0" }}>not specified</em> : val}
+                  </div>
+                </div>
+                {/* Status badge */}
+                <span
+                  style={{
+                    ...styles.badge,
+                    background: isUnsure ? "#fed7d7" : "#c6f6d5",
+                    color: isUnsure ? "#c53030" : "#276749",
+                  }}
+                >
+                  {isUnsure ? "unsure" : "known"}
+                </span>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -73,4 +102,13 @@ const styles: Record<string, React.CSSProperties> = {
   chipIcon: { fontSize: 16 },
   chipKey: { fontSize: 10, fontWeight: 700, color: "#718096", textTransform: "uppercase" },
   chipVal: { fontSize: 13, color: "#2d3748", fontWeight: 500 },
+  badge: {
+    fontSize: 9,
+    fontWeight: 700,
+    padding: "2px 6px",
+    borderRadius: 8,
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+    flexShrink: 0,
+  },
 };

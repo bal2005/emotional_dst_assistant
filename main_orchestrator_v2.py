@@ -27,6 +27,8 @@ DEFAULT_ORCHESTRATOR_ALPHA = 0.4  # EMA weight for in-memory running VAD
 conversation_state: Dict = {
     "history": [],
     "slots": {},                 # Emotion, Activity, Place, Event, Tag, Remedy
+    "slot_status": {},           # "known" | "unsure" per slot
+    "slots_asked": set(),        # slots already asked once — never ask again
     "running_vad": None,
     "preferences_asked": False,
     "alpha": DEFAULT_ORCHESTRATOR_ALPHA,
@@ -36,6 +38,8 @@ def reset_conversation_state():
     """Mutates the global conversation_state in-place so all importers see the reset."""
     conversation_state["history"] = []
     conversation_state["slots"] = {}
+    conversation_state["slot_status"] = {}
+    conversation_state["slots_asked"] = set()
     conversation_state["running_vad"] = None
     conversation_state["preferences_asked"] = False
     # alpha is intentionally preserved across resets
@@ -46,6 +50,28 @@ def set_alpha(alpha: float):
 
 MANDATORY_SLOTS = ["Activity", "Place"]
 OPTIONAL_SLOTS = ["Event", "Tag", "Remedy"]
+
+# ================== UNCERTAINTY DETECTION ==================
+UNCERTAINTY_PHRASES = {
+    "not sure", "no idea", "don't know", "dont know", "idk",
+    "maybe", "not really", "no preference", "anything", "whatever",
+    "doesn't matter", "doesnt matter", "no clue", "nothing",
+    "not certain", "unsure", "i don't mind", "i dont mind",
+    "up to you", "you decide", "no specific", "not particular",
+}
+
+def is_uncertain(text: str) -> bool:
+    """Return True if the user's response signals uncertainty or vagueness."""
+    t = text.strip().lower()
+    # Short responses (≤ 2 meaningful words)
+    words = [w for w in re.findall(r"[a-z]+", t) if len(w) > 1]
+    if len(words) <= 2:
+        return True
+    # Explicit uncertainty phrases
+    for phrase in UNCERTAINTY_PHRASES:
+        if phrase in t:
+            return True
+    return False
 
 # ================== SLOT ONTOLOGY ==================
 SLOT_ONTOLOGY = {
@@ -320,11 +346,12 @@ async def neo4j_recommend(slots: Dict) -> List[Dict]:
     return top
 
 # ================== LLM: Turn retrieved records into chat response ==================
-def llm_recommendation_response(emotion: str, slots: Dict, recs: List[Dict]) -> str:
+def llm_recommendation_response(emotion: str, slots: Dict, recs: List[Dict], unsure_slots: List[str] = None) -> str:
     """
     Generates a natural assistant reply using retrieved Neo4j records.
-    Returns a plain string (safe even if model adds extra junk).
+    unsure_slots: list of slot names the user was uncertain about — tone is adjusted accordingly.
     """
+    unsure_slots = unsure_slots or []
     recs_compact = []
     for r in recs:
         recs_compact.append({
@@ -335,11 +362,20 @@ def llm_recommendation_response(emotion: str, slots: Dict, recs: List[Dict]) -> 
             "why": r.get("why", [])[:3]
         })
 
+    uncertainty_note = ""
+    if unsure_slots:
+        uncertainty_note = (
+            f"\nNote: The user was unsure about: {', '.join(unsure_slots)}. "
+            "Do NOT ask about these again. Base suggestions purely on their emotion. "
+            "Keep the tone gentle and non-pressuring."
+        )
+
     prompt = f"""
 You are an empathetic wellness assistant for Chennai.
 
 User emotion: {emotion}
 Collected slots (may be incomplete): {json.dumps(slots, ensure_ascii=False)}
+{uncertainty_note}
 
 You MUST base your response ONLY on these 3 retrieved recommendations:
 {json.dumps(recs_compact, ensure_ascii=False)}
@@ -349,7 +385,8 @@ Write a friendly chat message:
 - Then suggest the 3 options as bullet points:
   • Place (Area) — Activity — 1 quick reason
 - Then suggest 1-2 quick remedies (from the remedies list) at the end
-- End with ONE short question to continue the conversation (e.g., "Want something closer to you?")
+- End with ONE soft, optional question (e.g., "Want something closer to you?")
+- If the user was unsure about preferences, do NOT ask them to specify — keep it open
 
 If the user gives feedback like he/she is relieved acknowledge that by saying a greeting message and ask for any room to improve their day.
 
@@ -404,30 +441,27 @@ def deterministic_reply(emotion: str, recs: List[Dict]) -> str:
 
 # ================== SLOT COMPLETENESS ==================
 def get_missing_slots(slots: Dict) -> List[str]:
-    return [s for s in MANDATORY_SLOTS if s not in slots]
+    """
+    Return mandatory slots that are:
+    - not yet filled (not in slots), AND
+    - not already marked unsure, AND
+    - not already asked once before
+    """
+    missing = []
+    for s in MANDATORY_SLOTS:
+        already_asked = s in conversation_state["slots_asked"]
+        already_unsure = conversation_state["slot_status"].get(s) == "unsure"
+        filled = s in slots and slots[s]
+        if not filled and not already_asked and not already_unsure:
+            missing.append(s)
+    return missing
 
 # ================== STATE RESET AFTER FINAL RECOMMENDATION ==================
 def reset_after_recommendation_keep_history():
-    """
-    Option A — Keep history (recommended)
-
-    Keep:
-    - history
-    - running_vad
-
-    Reset:
-    - slots
-    - preferences_asked
-
-    Why:
-    - better emotion continuity
-    - better preference extraction
-    - more natural conversation
-    """
     conversation_state["slots"] = {}
+    conversation_state["slot_status"] = {}
+    conversation_state["slots_asked"] = set()
     conversation_state["preferences_asked"] = False
-    # conversation_state["history"] = []   ❌ don't reset
-    # conversation_state["running_vad"] = None   ❌ don't reset
 
 # ================== MAIN TURN HANDLER ==================
 async def process_turn(user_text: str, alpha: float = None) -> Dict:
@@ -435,7 +469,6 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
 
     # Use provided alpha or fall back to stored value
     ema_alpha = alpha if alpha is not None else conversation_state["alpha"]
-    # Keep stored alpha in sync if caller passed one
     if alpha is not None:
         conversation_state["alpha"] = max(0.01, min(0.99, float(alpha)))
 
@@ -456,12 +489,28 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
     # -------- STEP 2: SLOT EXTRACTION (NO EMOTION OVERRIDE) --------
     extracted_slots = await asyncio.to_thread(extract_slots_from_text, user_text)
     extracted_slots.pop("Emotion", None)
-    conversation_state["slots"].update(extracted_slots)
 
-    # -------- STEP 3: MANDATORY SLOT CHECK --------
+    # -------- STEP 2a: UNCERTAINTY CHECK ON EXTRACTED SLOTS --------
+    # If the user's reply is uncertain, mark the slot we last asked about as "unsure"
+    # so we never block on it again.
+    if is_uncertain(user_text):
+        # Mark any mandatory slot we were waiting on as unsure
+        for slot in MANDATORY_SLOTS:
+            if slot in conversation_state["slots_asked"] and slot not in conversation_state["slots"]:
+                conversation_state["slot_status"][slot] = "unsure"
+                conversation_state["slots"][slot] = "unsure"   # placeholder so it's "filled"
+    else:
+        # Normal path — accept extracted values and mark them "known"
+        for k, v in extracted_slots.items():
+            conversation_state["slots"][k] = v
+            conversation_state["slot_status"][k] = "known"
+
+    # -------- STEP 3: MANDATORY SLOT CHECK (ONE ATTEMPT PER SLOT) --------
     missing_slots = get_missing_slots(conversation_state["slots"])
     if missing_slots:
         slot = missing_slots[0]
+        # Record that we've asked for this slot — will never ask again
+        conversation_state["slots_asked"].add(slot)
         question = await asyncio.to_thread(
             generate_clarification_question,
             slot,
@@ -472,30 +521,45 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
             "type": "clarification",
             "question": question,
             "slots_collected": conversation_state["slots"],
-            "running_vad": conversation_state["running_vad"]
+            "slot_status": dict(conversation_state["slot_status"]),
+            "running_vad": conversation_state["running_vad"],
         }
 
     # -------- STEP 4: ASK OPTIONAL PREFERENCES (ONCE) --------
-    if not conversation_state["preferences_asked"]:
+    # Skip preferences step if both mandatory slots are unsure — go straight to recs
+    both_unsure = all(
+        conversation_state["slot_status"].get(s) == "unsure" for s in MANDATORY_SLOTS
+    )
+    if not conversation_state["preferences_asked"] and not both_unsure:
         conversation_state["preferences_asked"] = True
         return {
             "type": "preferences",
             "question": generate_preferences_question(conversation_state["slots"].get("Emotion", "neutral")),
             "slots_collected": conversation_state["slots"],
-            "running_vad": conversation_state["running_vad"]
+            "slot_status": dict(conversation_state["slot_status"]),
+            "running_vad": conversation_state["running_vad"],
         }
 
     # -------- STEP 5: Neo4j Recommendations --------
-    recommendations = await neo4j_recommend(conversation_state["slots"])
+    # Build effective slots — replace "unsure" placeholders with empty string
+    # so the recommender falls back to pure emotion-based scoring
+    effective_slots = {
+        k: ("" if v == "unsure" else v)
+        for k, v in conversation_state["slots"].items()
+    }
+    recommendations = await neo4j_recommend(effective_slots)
 
     emotion = conversation_state["slots"].get("Emotion", "stressed")
 
     # -------- STEP 6: LLM Response from retrieved records --------
+    # Tell the LLM which slots were unsure so it can be more empathetic
+    unsure_slots = [k for k, v in conversation_state["slot_status"].items() if v == "unsure"]
     chat_response = await asyncio.to_thread(
         llm_recommendation_response,
         emotion,
-        conversation_state["slots"],
-        recommendations
+        effective_slots,
+        recommendations,
+        unsure_slots,
     )
 
     final_output = {
@@ -503,6 +567,7 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
         "emotion": emotion,
         "running_vad": conversation_state["running_vad"],
         "slots": dict(conversation_state["slots"]),
+        "slot_status": dict(conversation_state["slot_status"]),
         "recommendations": recommendations,
         "reply": chat_response,
         "alpha": conversation_state["alpha"],

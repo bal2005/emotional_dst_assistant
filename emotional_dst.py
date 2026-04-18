@@ -15,7 +15,7 @@ from typing import Dict, Tuple, Optional
 
 # ---------- CONFIG ----------
 DB_PATH = os.getenv("EMO_DBDIR", "emotional_state.db")
-DEFAULT_ALPHA = 0.6  # EMA smoothing factor
+DEFAULT_ALPHA = 0.8  # EMA smoothing factor
 
 # Llama local API
 LLAMA_API_URL = "http://localhost:1234/v1/chat/completions"

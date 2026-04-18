@@ -22,15 +22,27 @@ LLAMA_API_URL = "http://localhost:1234/v1/chat/completions"
 LLAMA_MODEL = "meta-llama-3.1-8b-instruct-hf"
 
 # ================== CONVERSATION STATE ==================
-def reset_conversation_state():
-    return {
-        "history": [],
-        "slots": {},                 # Emotion, Activity, Place, Event, Tag, Remedy
-        "running_vad": None,
-        "preferences_asked": False
-    }
+DEFAULT_ORCHESTRATOR_ALPHA = 0.4  # EMA weight for in-memory running VAD
 
-conversation_state = reset_conversation_state()
+conversation_state: Dict = {
+    "history": [],
+    "slots": {},                 # Emotion, Activity, Place, Event, Tag, Remedy
+    "running_vad": None,
+    "preferences_asked": False,
+    "alpha": DEFAULT_ORCHESTRATOR_ALPHA,
+}
+
+def reset_conversation_state():
+    """Mutates the global conversation_state in-place so all importers see the reset."""
+    conversation_state["history"] = []
+    conversation_state["slots"] = {}
+    conversation_state["running_vad"] = None
+    conversation_state["preferences_asked"] = False
+    # alpha is intentionally preserved across resets
+
+def set_alpha(alpha: float):
+    """Update the EMA alpha used for the running VAD. Clamped to [0.01, 0.99]."""
+    conversation_state["alpha"] = max(0.01, min(0.99, float(alpha)))
 
 MANDATORY_SLOTS = ["Activity", "Place"]
 OPTIONAL_SLOTS = ["Event", "Tag", "Remedy"]
@@ -339,6 +351,8 @@ Write a friendly chat message:
 - Then suggest 1-2 quick remedies (from the remedies list) at the end
 - End with ONE short question to continue the conversation (e.g., "Want something closer to you?")
 
+If the user gives feedback like he/she is relieved acknowledge that by saying a greeting message and ask for any room to improve their day.
+
 Return ONLY JSON:
 {{"reply": "<text>"}}
 """
@@ -416,23 +430,27 @@ def reset_after_recommendation_keep_history():
     # conversation_state["running_vad"] = None   ❌ don't reset
 
 # ================== MAIN TURN HANDLER ==================
-async def process_turn(user_text: str) -> Dict:
+async def process_turn(user_text: str, alpha: float = None) -> Dict:
     conversation_state["history"].append(user_text)
 
+    # Use provided alpha or fall back to stored value
+    ema_alpha = alpha if alpha is not None else conversation_state["alpha"]
+    # Keep stored alpha in sync if caller passed one
+    if alpha is not None:
+        conversation_state["alpha"] = max(0.01, min(0.99, float(alpha)))
+
     # -------- STEP 1: EMOTION + EMA (VAD) --------
-    dst_result = process_utterance(user_text)
+    dst_result = process_utterance(user_text, alpha=ema_alpha)
 
     if conversation_state["running_vad"] is None:
         conversation_state["slots"]["Emotion"] = dst_result["mapped_emotion"]
         conversation_state["running_vad"] = dst_result["merged"]
     else:
-        alpha = 0.4
         for k in ["valence", "arousal", "dominance"]:
             conversation_state["running_vad"][k] = (
-                alpha * dst_result["merged"][k]
-                + (1 - alpha) * conversation_state["running_vad"][k]
+                ema_alpha * dst_result["merged"][k]
+                + (1 - ema_alpha) * conversation_state["running_vad"][k]
             )
-        # keep emotion updated for the new trace as well
         conversation_state["slots"]["Emotion"] = dst_result["mapped_emotion"]
 
     # -------- STEP 2: SLOT EXTRACTION (NO EMOTION OVERRIDE) --------
@@ -486,7 +504,8 @@ async def process_turn(user_text: str) -> Dict:
         "running_vad": conversation_state["running_vad"],
         "slots": dict(conversation_state["slots"]),
         "recommendations": recommendations,
-        "reply": chat_response
+        "reply": chat_response,
+        "alpha": conversation_state["alpha"],
     }
 
     # -------- STEP 7: RESET FOR NEXT TRACE (KEEP HISTORY) --------
@@ -496,7 +515,7 @@ async def process_turn(user_text: str) -> Dict:
 
 # ================== INTERACTIVE LOOP ==================
 if __name__ == "__main__":
-    conversation_state = reset_conversation_state()
+    reset_conversation_state()
 
     print("\n🟢 Welcome to the Emotional Wellness Assistant 🌱")
     print("You can talk freely about how you're feeling or what you want to do.")

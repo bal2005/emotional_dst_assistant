@@ -1,2 +1,6 @@
 .env
 dup.txt
+/webapp/frontend/node_modules
+/webapp/backend/emotional_state.db
+\__pycache__
+emotional_state.db

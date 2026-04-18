@@ -25,7 +25,7 @@ export type Recommendation = {
   why: string[];
 };
 
-const API = "";
+const API = import.meta.env.VITE_API_URL ?? "";
 const DEFAULT_ALPHA = 0.4;
 
 export default function App() {

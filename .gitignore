@@ -4,3 +4,4 @@ dup.txt
 /webapp/backend/emotional_state.db
 \__pycache__
 emotional_state.db
+prompt.txt

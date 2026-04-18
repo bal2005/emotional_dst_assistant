@@ -37,6 +37,7 @@ conversation_state: Dict = {
     "preferences_asked": False,
     "awaiting_preferences": False,  # True while waiting for the preferences reply
     "_was_preferences_turn": False, # True on the turn that IS the preferences reply
+    "awaiting_clarification": False, # True while waiting for a slot clarification reply
     "alpha": DEFAULT_ORCHESTRATOR_ALPHA,
 }
 
@@ -50,6 +51,7 @@ def reset_conversation_state():
     conversation_state["preferences_asked"] = False
     conversation_state["awaiting_preferences"] = False
     conversation_state["_was_preferences_turn"] = False
+    conversation_state["awaiting_clarification"] = False
     # Reset DST dialogue state too
     dialogue_state.reset()
     # alpha is intentionally preserved across resets
@@ -474,6 +476,7 @@ def reset_after_recommendation_keep_history():
     conversation_state["preferences_asked"] = False
     conversation_state["awaiting_preferences"] = False
     conversation_state["_was_preferences_turn"] = False
+    conversation_state["awaiting_clarification"] = False
 
 # ================== MAIN TURN HANDLER ==================
 async def process_turn(user_text: str, alpha: float = None) -> Dict:
@@ -485,17 +488,24 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
         conversation_state["alpha"] = max(0.01, min(0.99, float(alpha)))
 
     # -------- STEP 1: EMOTION + CONTEXT-AWARE VAD (DST) --------
-    # GUARD: skip VAD entirely if this turn is the user's reply to the
-    # preferences question — that reply ("No", "quiet place", etc.) carries
-    # no emotional signal and must NOT corrupt the running VAD / emotion state.
-    if conversation_state["awaiting_preferences"]:
-        # Mark preferences as consumed; VAD state is intentionally unchanged
+    # Skip VAD update for two types of non-emotional turns:
+    #   A) Preferences reply  — "No", "quiet place", etc.
+    #   B) Uncertain clarification reply — "No idea", "nothing", etc.
+    #      These are answers to slot questions, not emotional expressions.
+    #      Scoring them corrupts the running VAD.
+
+    is_clarification_reply = (
+        conversation_state["awaiting_clarification"] and is_uncertain(user_text)
+    )
+
+    if conversation_state["awaiting_preferences"] or is_clarification_reply:
         conversation_state["awaiting_preferences"] = False
+        conversation_state["awaiting_clarification"] = False
         conversation_state["_was_preferences_turn"] = True
-        dst_result = None   # no VAD update this turn
+        dst_result = None   # VAD state intentionally unchanged
     else:
+        conversation_state["awaiting_clarification"] = False
         conversation_state["_was_preferences_turn"] = False
-        # Normal turn — run the full DST pipeline
         dst_result = process_input(user_text, dialogue_state)
 
         if conversation_state["running_vad"] is None:
@@ -511,22 +521,39 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
             # We must NOT let these overwrite a strong established emotion
             # (e.g. "happy" from "I am celebrating my birthday today").
             #
-            # Only update the emotion slot when BOTH:
-            #   1. New confidence is meaningful  (≥ 0.4)
-            #   2. Context score is low  (< 0.6) — history not strongly anchored
-            # OR the new emotion is the same as the current one (reinforcement).
-            new_emotion = dst_result["mapped_emotion"]
-            new_conf    = dst_result.get("mapped_confidence", 0.0)
-            ctx_score   = dst_result.get("context_score", 0.0)
-            cur_emotion = conversation_state["slots"].get("Emotion", "neutral")
+            # Update emotion when ANY of these is true:
+            #   1. Same emotion (reinforcement)
+            #   2. Confidence is high (≥ 0.5) — strong clear signal
+            #   3. A positive event is active AND new emotion is positive
+            #      (birthday → happy should always win)
+            # Block update when:
+            #   - Low confidence (< 0.4) AND context is anchored (ctx_score ≥ 0.4)
+            new_emotion   = dst_result["mapped_emotion"]
+            new_conf      = dst_result.get("mapped_confidence", 0.0)
+            ctx_score     = dst_result.get("context_score", 0.0)
+            cur_emotion   = conversation_state["slots"].get("Emotion", "neutral")
+            active_event  = dialogue_state.event
+
+            POSITIVE_EVENTS   = {"birthday", "promotion", "wedding", "anniversary",
+                                  "graduation", "party", "celebration"}
+            POSITIVE_EMOTIONS = {"happy"}
+
+            event_is_positive = active_event in POSITIVE_EVENTS if active_event else False
+            new_is_positive   = new_emotion in POSITIVE_EMOTIONS
 
             if new_emotion == cur_emotion:
                 # Reinforcement — always accept
                 conversation_state["slots"]["Emotion"] = new_emotion
-            elif new_conf >= 0.4 and ctx_score < 0.6:
-                # Different emotion, decent signal, history not strongly anchored
+            elif event_is_positive and new_is_positive:
+                # Positive event context — trust the positive emotion signal
                 conversation_state["slots"]["Emotion"] = new_emotion
-            # else: keep current emotion — low-confidence turn or stable history
+            elif new_conf >= 0.5:
+                # Strong confident signal — accept regardless
+                conversation_state["slots"]["Emotion"] = new_emotion
+            elif new_conf >= 0.4 and ctx_score < 0.4:
+                # Moderate signal, low history anchor — accept
+                conversation_state["slots"]["Emotion"] = new_emotion
+            # else: keep current emotion
 
     # -------- STEP 2: SLOT EXTRACTION (NO EMOTION OVERRIDE) --------
     # Skip slot extraction entirely on a preferences reply — the user is answering
@@ -553,8 +580,8 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
     missing_slots = get_missing_slots(conversation_state["slots"])
     if missing_slots:
         slot = missing_slots[0]
-        # Record that we've asked for this slot — will never ask again
         conversation_state["slots_asked"].add(slot)
+        conversation_state["awaiting_clarification"] = True  # next reply is a slot answer
         question = await asyncio.to_thread(
             generate_clarification_question,
             slot,

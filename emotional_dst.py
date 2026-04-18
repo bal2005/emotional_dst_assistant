@@ -213,50 +213,50 @@ def compute_vad_llm(text: str, context_summary: str = ""):
     """
     context_block = ""
     if context_summary:
-        context_block = f"""
-Conversation context (use only to interpret ambiguous words):
-{context_summary}
+        context_block = f"Context: {context_summary}\n"
 
-"""
+    system_msg = (
+        "You are a VAD scoring API. "
+        "You ONLY output a single valid JSON object with three keys: "
+        "valence, arousal, dominance. "
+        "All values are floats in [-1.0, 1.0]. "
+        "No explanation. No code. No markdown. No extra text. JSON only."
+    )
 
-    prompt = f"""
-You are a JSON API. 
-Extract Valence, Arousal, Dominance (VAD) values in [-1,1] for the given text.  
-{context_block}
-Reference Emotion Centroids (for context only):
-{{
-    "happy":    {{"valence": 1.000, "arousal": 0.357, "dominance": 1.000}},
-    "shocked":  {{"valence": 0.214, "arousal": 0.477, "dominance": 0.219}},
-    "neutral":  {{"valence": 0.048, "arousal": -1.000, "dominance": -1.000}},
-    "angry":    {{"valence": 0.000, "arousal": 1.000, "dominance": 0.582}},
-    "lonely":   {{"valence": 0.145, "arousal": -0.751, "dominance": -0.796}},
-    "stressed": {{"valence": 0.045, "arousal": 0.362, "dominance": -0.218}}
-}}
+    user_msg = f"""{context_block}Score the emotional VAD for this text.
 
+Emotion centroids (target VAD values for each emotion):
+- happy    → valence  0.60, arousal  0.30, dominance  0.50
+- angry    → valence -0.70, arousal  0.80, dominance  0.40
+- anxious  → valence -0.55, arousal  0.65, dominance -0.40
+- stressed → valence -0.40, arousal  0.50, dominance -0.30
+- shocked  → valence  0.05, arousal  0.75, dominance -0.25
+- sad      → valence -0.60, arousal -0.30, dominance -0.40
+- lonely   → valence -0.50, arousal -0.40, dominance -0.50
+- bored    → valence -0.20, arousal -0.60, dominance -0.20
+- neutral  → valence  0.05, arousal -0.40, dominance -0.30
 
-⚠️ IMPORTANT: Return ONLY a single valid JSON object. 
-Do not include any explanation, code, or extra text.  
-
-Format:
-{{
-  "valence": <float>,
-  "arousal": <float>,
-  "dominance": <float>
-}}
+Score the text toward the nearest centroid. Interpolate for mixed emotions.
 
 Text: "{text}"
-"""
+
+Reply with ONLY this JSON (no other text):
+{{"valence": <float>, "arousal": <float>, "dominance": <float>}}"""
 
     try:
         payload = {
             "model": LLAMA_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 60,
+            "stream": False,
         }
         resp = requests.post(LLAMA_API_URL, json=payload)
         data = resp.json()
 
-        # 🔎 Debug log entire raw response
         raw = data["choices"][0]["message"]["content"].strip()
         print("🔎 LLM Raw Output:", raw)
 
@@ -292,42 +292,42 @@ def compute_vad_hybrid(text: str, w_mweuni=0.3, w_llm=0.7):
     return vad1, vad2, merged, {"mwe_info": info1, "llm_info": info2}
 
 # ---------- EMOTION MAPPING ----------
-# EMOTION_CENTROIDS = {
-#     "anxious": {"valence": -0.6, "arousal": 0.7, "dominance": -0.3},
-#     "sad": {"valence": -0.6, "arousal": -0.2, "dominance": -0.4},
-#     "lonely": {"valence": -0.4, "arousal": 0.2, "dominance": -0.2},
-#     "bored": {"valence": 0.0, "arousal": 0.0, "dominance": 0.0},
-#     "happy": {"valence": 0.8, "arousal": 0.4, "dominance": 0.5},
-#     "angry": {"valence": -0.7, "arousal": 0.8, "dominance": 0.4},
-#     "stressed": {"valence": -0.3, "arousal": 0.3, "dominance": -0.1},
-#}
+# Centroids are calibrated so that realistic LLM VAD outputs (not extreme ±1)
+# map cleanly to the correct emotion. Each centroid is the target VAD point
+# for that emotion in the 3D valence-arousal-dominance space.
+#
+# Valence  : positive = pleasant,  negative = unpleasant
+# Arousal  : positive = activated, negative = calm/deactivated
+# Dominance: positive = in control, negative = submissive/overwhelmed
 
 EMOTION_CENTROIDS = {
-    "happy":    {"valence": 1.000, "arousal": 0.357, "dominance": 1.000},
-    "shocked":  {"valence": 0.214, "arousal": 0.477, "dominance": 0.219},
-    "neutral":  {"valence": 0.048, "arousal": -1.000, "dominance": -1.000},
-    "angry":    {"valence": 0.000, "arousal": 1.000, "dominance": 0.582},
-    "lonely":   {"valence": 0.145, "arousal": -0.751, "dominance": -0.796},
-    "stressed": {"valence": 0.045, "arousal": 0.362, "dominance": -0.218}
+    # Positive
+    "happy":    {"valence":  0.60, "arousal":  0.30, "dominance":  0.50},
+
+    # Negative — high arousal
+    "angry":    {"valence": -0.70, "arousal":  0.80, "dominance":  0.40},
+    "anxious":  {"valence": -0.55, "arousal":  0.65, "dominance": -0.40},
+    "stressed": {"valence": -0.40, "arousal":  0.50, "dominance": -0.30},
+    "shocked":  {"valence":  0.05, "arousal":  0.75, "dominance": -0.25},
+
+    # Negative — low arousal
+    "sad":      {"valence": -0.60, "arousal": -0.30, "dominance": -0.40},
+    "lonely":   {"valence": -0.50, "arousal": -0.40, "dominance": -0.50},
+    "bored":    {"valence": -0.20, "arousal": -0.60, "dominance": -0.20},
+
+    # Neutral
+    "neutral":  {"valence":  0.05, "arousal": -0.40, "dominance": -0.30},
 }
 
 
-
-
-def nearest_emotion(vad: Dict[str,float]) -> Tuple[str,float]:
-    EMOTION_CENTROIDS = {
-    "happy":    {"valence": 1.000, "arousal": 0.357, "dominance": 1.000},
-    "shocked":  {"valence": 0.214, "arousal": 0.477, "dominance": 0.219},
-    "neutral":  {"valence": 0.048, "arousal": -1.000, "dominance": -1.000},
-    "angry":    {"valence": 0.000, "arousal": 1.000, "dominance": 0.582},
-    "lonely":   {"valence": 0.145, "arousal": -0.751, "dominance": -0.796},
-    "stressed": {"valence": 0.045, "arousal": 0.362, "dominance": -0.218}
-}
+def nearest_emotion(vad: Dict[str, float]) -> Tuple[str, float]:
+    """Map a VAD vector to the nearest emotion centroid using Euclidean distance."""
     best, bestd = None, 1e9
     for emo, c in EMOTION_CENTROIDS.items():
-        d = math.sqrt(sum((vad[k]-c[k])**2 for k in ["valence","arousal","dominance"]))
-        if d < bestd: bestd, best = d, emo
-    return best, max(0.0, 1 - bestd/3.0)
+        d = math.sqrt(sum((vad[k] - c[k]) ** 2 for k in ["valence", "arousal", "dominance"]))
+        if d < bestd:
+            bestd, best = d, emo
+    return best, max(0.0, 1 - bestd / 3.0)
 
 # ---------- EMA ----------
 def ema_update(prev: Optional[Dict[str,float]], curr: Dict[str,float], alpha=DEFAULT_ALPHA) -> Dict[str,float]:
@@ -453,8 +453,12 @@ def _detect_event(text: str) -> Optional[str]:
 
 def context_summary(state: DialogueState) -> str:
     """
-    Generate a compact 3-line context string for the LLM.
+    Generate a compact context string for the LLM.
     Uses only the last 3 VAD values — never the raw chat history.
+
+    Called BEFORE the current turn's VAD is stored, so we also include
+    the detected event from the current turn (already set in Step 2)
+    even when vad_history is empty (Turn 1).
 
     Example output:
         Previous emotional trend:
@@ -462,14 +466,22 @@ def context_summary(state: DialogueState) -> str:
         Emotion  ~ happy
         Event    ~ birthday
     """
-    if not state.vad_history:
-        return ""   # no history yet — LLM works without context
+    event_str = state.event if state.event else "None"
 
-    # Average valence over last 3 turns
+    # Turn 1: no VAD history yet — still send event context so LLM
+    # knows this is a birthday/exam/etc. conversation from the start
+    if not state.vad_history:
+        if state.event:
+            return (
+                f"Conversation context:\n"
+                f"Event    ~ {event_str}\n"
+                f"Note: This is the first message. Interpret emotion accordingly."
+            )
+        return ""
+
+    # Turn 2+: include average valence trend + last emotion + event
     recent = state.vad_history[-3:]
     avg_valence = sum(v["valence"] for v in recent) / len(recent)
-
-    event_str = state.event if state.event else "None"
 
     return (
         f"Previous emotional trend:\n"
@@ -490,26 +502,25 @@ def get_context_score(state: DialogueState) -> float:
     High score  → history is strong / consistent → resist sudden change
     Low score   → little history or high variance → accept new input freely
 
-    Algorithm
-    ---------
-    1. Need at least 2 past VAD values to compute variance.
-    2. Compute variance of valence over last 3 turns.
-    3. Low variance  → stable emotion  → high context score
-    4. High variance → volatile emotion → low context score
+    Extra guard: if the established emotion is weakly positive (valence < 0.3),
+    cap the context score at 0.4 so the system stays open to correction.
+    A "stably wrong" low-valence state should not resist positive signals.
     """
     if len(state.vad_history) < 2:
-        # Not enough history — treat as low context (accept new input)
         return 0.0
 
-    recent = state.vad_history[-3:]
+    recent   = state.vad_history[-3:]
     valences = [v["valence"] for v in recent]
     mean_v   = sum(valences) / len(valences)
     variance = sum((v - mean_v) ** 2 for v in valences) / len(valences)
 
-    # Map variance → stability score (inverse relationship)
-    # variance=0   → score=1.0 (perfectly stable)
-    # variance=0.5 → score=0.0 (very volatile)
     stability = max(0.0, 1.0 - variance / 0.5)
+
+    # If the average valence is weakly positive (< 0.3) and the emotion
+    # is not clearly negative, cap stability — don't lock in an uncertain state
+    if mean_v < 0.3 and state.last_emotion not in ("angry", "stressed", "lonely"):
+        stability = min(stability, 0.4)
+
     return round(stability, 4)
 
 
@@ -598,12 +609,15 @@ def process_input(text: str, state: DialogueState) -> Dict:
     # ── Step 1: store raw text ──────────────────────────────────────────────
     state.chat_history.append(text)
 
-    # ── Step 2: event detection ─────────────────────────────────────────────
+    # ── Step 2: event detection — MUST happen before context_summary ────────
+    # so the event is included in the summary even on Turn 1
     detected_event = _detect_event(text)
     if detected_event:
-        state.event = detected_event   # overwrite with most recent event
+        state.event = detected_event
 
     # ── Step 3: context summary (compact, no raw history) ───────────────────
+    # On Turn 1: vad_history is empty but event is already set above,
+    # so the summary will include the event keyword for the LLM.
     ctx_summary = context_summary(state)
 
     # ── Step 4: LLM VAD — stateless, gets only current text + summary ───────
@@ -626,6 +640,8 @@ def process_input(text: str, state: DialogueState) -> Dict:
     }
 
     # ── Step 7: Context-aware update ─────────────────────────────────────────
+    # Compute context score BEFORE appending so it reflects history up to
+    # the previous turn (correct — current turn hasn't been stored yet)
     ctx_score   = get_context_score(state)
     updated_vad = context_aware_vad_update(state, fused_vad, llm_conf, lex_conf)
 
@@ -637,6 +653,10 @@ def process_input(text: str, state: DialogueState) -> Dict:
     # ── Step 8: Store in state ────────────────────────────────────────────────
     state.vad_history.append(updated_vad)
     state.last_vad = updated_vad
+
+    # ── Step 8b: Recompute context score AFTER storing so the returned value
+    # reflects the current turn being included — this is what the frontend shows
+    ctx_score_after = get_context_score(state)
 
     # ── Step 9: Emotion mapping ───────────────────────────────────────────────
     emotion, conf = nearest_emotion(updated_vad)
@@ -657,12 +677,12 @@ def process_input(text: str, state: DialogueState) -> Dict:
         "llm_vad":              llm_vad,
         "lex_vad":              lex_vad,
         "fused_vad":            fused_vad,
-        "context_score":        ctx_score,
+        "context_score":        ctx_score_after,   # post-append — reflects current turn
         "effective_alpha":      round(eff_alpha, 4),
         "updated_vad":          updated_vad,
         "mapped_emotion":       emotion,
         "mapped_confidence":    conf,
-        "merged":               updated_vad,   # alias — keeps orchestrator compatible
+        "merged":               updated_vad,
         "context_summary_used": ctx_summary,
         "event":                state.event,
     }

@@ -205,11 +205,24 @@ def compute_vad_unigram_weighted(text: str):
 
 
 # ---------- LLM (Llama) ----------
-def compute_vad_llm(text: str):
+def compute_vad_llm(text: str, context_summary: str = ""):
+    """
+    Stateless LLM VAD extractor.
+    Accepts an optional context_summary (compact string, NOT full history)
+    so the LLM can interpret ambiguous inputs more accurately.
+    """
+    context_block = ""
+    if context_summary:
+        context_block = f"""
+Conversation context (use only to interpret ambiguous words):
+{context_summary}
+
+"""
+
     prompt = f"""
 You are a JSON API. 
 Extract Valence, Arousal, Dominance (VAD) values in [-1,1] for the given text.  
-
+{context_block}
 Reference Emotion Centroids (for context only):
 {{
     "happy":    {{"valence": 1.000, "arousal": 0.357, "dominance": 1.000}},
@@ -349,6 +362,316 @@ def process_utterance(text: str, alpha=DEFAULT_ALPHA, maintain_state=True):
     }
 
 # ---------- CLI ----------
+if __name__ == "__main__":
+    import sys
+    init_db()
+    if len(sys.argv) < 2:
+        print("Usage: python emotional_dst.py \"I feel stressed today\"")
+        sys.exit(0)
+
+    text = " ".join(sys.argv[1:])
+    print("Processing:", text)
+    res = process_utterance(text)
+    print(json.dumps(res, indent=2))
+
+
+# =============================================================================
+# ██████╗ ███████╗████████╗    ██╗      █████╗ ██╗   ██╗███████╗██████╗
+# ██╔══██╗██╔════╝╚══██╔══╝    ██║     ██╔══██╗╚██╗ ██╔╝██╔════╝██╔══██╗
+# ██║  ██║███████╗   ██║       ██║     ███████║ ╚████╔╝ █████╗  ██████╔╝
+# ██║  ██║╚════██║   ██║       ██║     ██╔══██║  ╚██╔╝  ██╔══╝  ██╔══██╗
+# ██████╔╝███████║   ██║       ███████╗██║  ██║   ██║   ███████╗██║  ██║
+# ╚═════╝ ╚══════╝   ╚═╝       ╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+#
+# Context-Aware Dialogue State Tracking (DST) Layer
+# --------------------------------------------------
+# Principle:
+#   LLM  = stateless signal extractor  (current turn only)
+#   DST  = stateful memory + reasoning (across all turns)
+#
+# Key design decisions:
+#   - LLM never receives full chat history (token efficiency)
+#   - LLM receives only a compact 3-line context summary
+#   - Context score controls how much a new input can shift the state
+#   - Strong past emotion resists sudden flips from low-info inputs
+# =============================================================================
+
+from dataclasses import dataclass, field
+from typing import List
+
+# ---------------------------------------------------------------------------
+# 1. DialogueState — persists across all turns of a conversation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DialogueState:
+    """
+    Holds the full emotional memory of a conversation.
+
+    Attributes
+    ----------
+    chat_history  : raw user messages in order
+    vad_history   : fused VAD dict per turn  [{valence, arousal, dominance}, ...]
+    last_vad      : most recently stored VAD (after context-aware update)
+    last_emotion  : emotion label mapped from last_vad
+    event         : detected event keyword (e.g. "birthday", "exam", "breakup")
+    """
+    chat_history:  List[str]             = field(default_factory=list)
+    vad_history:   List[Dict[str,float]] = field(default_factory=list)
+    last_vad:      Optional[Dict[str,float]] = None
+    last_emotion:  str                   = "neutral"
+    event:         Optional[str]         = None
+
+    def reset(self):
+        """Clear all state (call between independent conversations)."""
+        self.chat_history.clear()
+        self.vad_history.clear()
+        self.last_vad     = None
+        self.last_emotion = "neutral"
+        self.event        = None
+
+
+# ---------------------------------------------------------------------------
+# 2. context_summary — compact 3-line string fed to the LLM prompt
+# ---------------------------------------------------------------------------
+
+# Keywords that indicate a named event in the user's message
+_EVENT_KEYWORDS = {
+    "birthday", "exam", "interview", "breakup", "wedding", "funeral",
+    "promotion", "accident", "party", "anniversary", "graduation",
+    "deadline", "presentation", "trip", "vacation", "loss", "grief",
+}
+
+def _detect_event(text: str) -> Optional[str]:
+    """Return the first event keyword found in text, or None."""
+    t = text.lower()
+    for kw in _EVENT_KEYWORDS:
+        if kw in t:
+            return kw
+    return None
+
+
+def context_summary(state: DialogueState) -> str:
+    """
+    Generate a compact 3-line context string for the LLM.
+    Uses only the last 3 VAD values — never the raw chat history.
+
+    Example output:
+        Previous emotional trend:
+        Valence  ~ 0.72
+        Emotion  ~ happy
+        Event    ~ birthday
+    """
+    if not state.vad_history:
+        return ""   # no history yet — LLM works without context
+
+    # Average valence over last 3 turns
+    recent = state.vad_history[-3:]
+    avg_valence = sum(v["valence"] for v in recent) / len(recent)
+
+    event_str = state.event if state.event else "None"
+
+    return (
+        f"Previous emotional trend:\n"
+        f"Valence  ~ {avg_valence:.2f}\n"
+        f"Emotion  ~ {state.last_emotion}\n"
+        f"Event    ~ {event_str}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. get_context_score — how strongly should history resist the new input?
+# ---------------------------------------------------------------------------
+
+def get_context_score(state: DialogueState) -> float:
+    """
+    Returns a score in [0.0, 1.0] representing emotional stability.
+
+    High score  → history is strong / consistent → resist sudden change
+    Low score   → little history or high variance → accept new input freely
+
+    Algorithm
+    ---------
+    1. Need at least 2 past VAD values to compute variance.
+    2. Compute variance of valence over last 3 turns.
+    3. Low variance  → stable emotion  → high context score
+    4. High variance → volatile emotion → low context score
+    """
+    if len(state.vad_history) < 2:
+        # Not enough history — treat as low context (accept new input)
+        return 0.0
+
+    recent = state.vad_history[-3:]
+    valences = [v["valence"] for v in recent]
+    mean_v   = sum(valences) / len(valences)
+    variance = sum((v - mean_v) ** 2 for v in valences) / len(valences)
+
+    # Map variance → stability score (inverse relationship)
+    # variance=0   → score=1.0 (perfectly stable)
+    # variance=0.5 → score=0.0 (very volatile)
+    stability = max(0.0, 1.0 - variance / 0.5)
+    return round(stability, 4)
+
+
+# ---------------------------------------------------------------------------
+# 4. context_aware_vad_update — replaces plain EMA
+# ---------------------------------------------------------------------------
+
+def context_aware_vad_update(
+    state:       DialogueState,
+    fused_vad:   Dict[str, float],
+    llm_conf:    float,
+    lex_conf:    float,
+) -> Dict[str, float]:
+    """
+    Combine previous state + new fused VAD using context score as a brake.
+
+    Formula (per dimension):
+        input_weight   = mean(llm_conf, lex_conf)          # signal quality
+        context_score  = get_context_score(state)          # history stability
+        resistance     = context_score * (1 - input_weight)
+        effective_alpha = input_weight * (1 - resistance)
+        new_vad = effective_alpha * fused_vad
+                + (1 - effective_alpha) * last_vad
+
+    Behaviour
+    ---------
+    - Strong past emotion + weak new signal  → small shift  (stability)
+    - Weak past emotion   + strong new signal → larger shift (responsiveness)
+    - No history at all                       → accept fused_vad directly
+    """
+    if state.last_vad is None:
+        # First turn — no history to blend with
+        return fused_vad.copy()
+
+    input_weight  = (llm_conf + lex_conf) / 2.0          # 0–1
+    ctx_score     = get_context_score(state)              # 0–1
+    resistance    = ctx_score * (1.0 - input_weight)      # 0–1
+    eff_alpha     = input_weight * (1.0 - resistance)     # effective blend weight
+    # Clamp to a sensible range so we never fully freeze or fully ignore history
+    eff_alpha     = max(0.05, min(0.95, eff_alpha))
+
+    updated = {
+        k: round(eff_alpha * fused_vad[k] + (1.0 - eff_alpha) * state.last_vad[k], 6)
+        for k in ["valence", "arousal", "dominance"]
+    }
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# 5. process_input — the clean DST pipeline (replaces process_utterance)
+# ---------------------------------------------------------------------------
+
+def process_input(text: str, state: DialogueState) -> Dict:
+    """
+    Full context-aware VAD pipeline.
+
+    Steps
+    -----
+    1.  Append text to chat history
+    2.  Detect & store event keyword (if any)
+    3.  Generate compact context summary (3 lines, no raw history)
+    4.  Compute LLM VAD  — stateless, receives only current text + summary
+    5.  Compute Lexicon VAD (weighted unigram)
+    6.  Fuse: confidence-weighted blend of LLM + Lexicon
+    7.  Context-aware update (replaces EMA)
+    8.  Store updated VAD in state.vad_history and state.last_vad
+    9.  Map to nearest emotion label
+    10. Persist to SQLite (same DB as process_utterance)
+    11. Return structured result dict
+
+    Parameters
+    ----------
+    text  : current user utterance
+    state : DialogueState instance (mutated in-place)
+
+    Returns
+    -------
+    dict with keys:
+        input, llm_vad, lex_vad, fused_vad, context_score,
+        effective_alpha (approx), updated_vad,
+        mapped_emotion, mapped_confidence,
+        context_summary_used, event
+    """
+    init_db(DB_PATH)
+
+    # ── Step 1: store raw text ──────────────────────────────────────────────
+    state.chat_history.append(text)
+
+    # ── Step 2: event detection ─────────────────────────────────────────────
+    detected_event = _detect_event(text)
+    if detected_event:
+        state.event = detected_event   # overwrite with most recent event
+
+    # ── Step 3: context summary (compact, no raw history) ───────────────────
+    ctx_summary = context_summary(state)
+
+    # ── Step 4: LLM VAD — stateless, gets only current text + summary ───────
+    llm_vad, llm_conf, llm_info = compute_vad_llm(text, context_summary=ctx_summary)
+
+    # ── Step 5: Lexicon VAD ──────────────────────────────────────────────────
+    lex_vad, lex_conf, lex_info = compute_vad_unigram_weighted(text)
+
+    # ── Step 6: Confidence-weighted fusion ───────────────────────────────────
+    total_conf = llm_conf + lex_conf
+    if total_conf > 0:
+        w_llm = llm_conf / total_conf
+        w_lex = lex_conf / total_conf
+    else:
+        w_llm, w_lex = 0.7, 0.3   # fallback weights
+
+    fused_vad = {
+        k: round(w_llm * llm_vad[k] + w_lex * lex_vad[k], 6)
+        for k in ["valence", "arousal", "dominance"]
+    }
+
+    # ── Step 7: Context-aware update ─────────────────────────────────────────
+    ctx_score   = get_context_score(state)
+    updated_vad = context_aware_vad_update(state, fused_vad, llm_conf, lex_conf)
+
+    # Approximate effective_alpha for transparency in the return dict
+    input_weight = (llm_conf + lex_conf) / 2.0
+    resistance   = ctx_score * (1.0 - input_weight)
+    eff_alpha    = max(0.05, min(0.95, input_weight * (1.0 - resistance)))
+
+    # ── Step 8: Store in state ────────────────────────────────────────────────
+    state.vad_history.append(updated_vad)
+    state.last_vad = updated_vad
+
+    # ── Step 9: Emotion mapping ───────────────────────────────────────────────
+    emotion, conf = nearest_emotion(updated_vad)
+    state.last_emotion = emotion
+
+    # ── Step 10: Persist to SQLite ────────────────────────────────────────────
+    insert_utterance(text, llm_vad,    llm_conf, "DST-LLM",    llm_info)
+    insert_utterance(text, lex_vad,    lex_conf, "DST-Lexicon", lex_info)
+    insert_utterance(text, updated_vad, conf,    "DST-Final",   {
+        "context_score": ctx_score,
+        "effective_alpha": round(eff_alpha, 4),
+        "event": state.event,
+    })
+
+    # ── Step 11: Return ───────────────────────────────────────────────────────
+    return {
+        "input":                text,
+        "llm_vad":              llm_vad,
+        "lex_vad":              lex_vad,
+        "fused_vad":            fused_vad,
+        "context_score":        ctx_score,
+        "effective_alpha":      round(eff_alpha, 4),
+        "updated_vad":          updated_vad,
+        "mapped_emotion":       emotion,
+        "mapped_confidence":    conf,
+        "merged":               updated_vad,   # alias — keeps orchestrator compatible
+        "context_summary_used": ctx_summary,
+        "event":                state.event,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI — quick test of the DST pipeline
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import sys
     init_db()

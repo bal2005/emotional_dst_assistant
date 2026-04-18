@@ -8,7 +8,13 @@ import AlphaSlider from "./components/AlphaSlider";
 export type Message = { role: "user" | "assistant"; text: string };
 export type Slots = Record<string, string>;
 export type SlotStatus = Record<string, "known" | "unsure">;
-export type Vad = { valence?: number; arousal?: number; dominance?: number };
+export type Vad = {
+  valence?: number;
+  arousal?: number;
+  dominance?: number;
+  context_score?: number;
+  effective_alpha?: number;
+};
 export type Recommendation = {
   place: string;
   area: string;
@@ -56,7 +62,27 @@ export default function App() {
           setSlots(data.slots || data.slots_collected || {});
         }
         if (data.slot_status) setSlotStatus(data.slot_status);
-        if (data.running_vad) setVad(data.running_vad);
+
+        // Update VAD panel on every turn that carries running_vad.
+        // Also merge context_score / effective_alpha — they arrive on every
+        // response type (clarification, preferences, final) so the DST
+        // sidebar stays live throughout the conversation.
+        if (data.running_vad) {
+          setVad({
+            ...data.running_vad,
+            context_score:   data.context_score   ?? undefined,
+            effective_alpha: data.effective_alpha ?? undefined,
+          });
+        } else if (data.context_score != null || data.effective_alpha != null) {
+          // running_vad unchanged (e.g. preferences-reply turn) but DST
+          // meta may have updated — merge into existing vad state
+          setVad((prev) => ({
+            ...prev,
+            context_score:   data.context_score   ?? prev.context_score,
+            effective_alpha: data.effective_alpha ?? prev.effective_alpha,
+          }));
+        }
+
         if (data.recommendations) setRecs(data.recommendations);
       } catch {
         setMessages((prev) => [
@@ -118,7 +144,7 @@ export default function App() {
     <div style={styles.root}>
       <header style={styles.header}>
         <span style={styles.logo}>🌿</span>
-        <h1 style={styles.title}>Emotional Wellness Assistant</h1>
+        <h1 style={styles.title}>FeelWell AI:Emotional Wellness Assistant</h1>
         <button style={styles.resetBtn} onClick={handleReset} disabled={loading}>
           {loading ? "..." : "Reset"}
         </button>

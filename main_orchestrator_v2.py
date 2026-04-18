@@ -15,7 +15,11 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 # ================== IMPORT UNCHANGED DST CORE ==================
 # DO NOT MODIFY emotional_dst.py
-from emotional_dst import process_utterance
+from emotional_dst import process_utterance, process_input, DialogueState
+
+# ================== SHARED DIALOGUE STATE (DST) ==================
+# One instance per server process — persists across all turns
+dialogue_state = DialogueState()
 
 # ================== LLM CONFIG ==================
 LLAMA_API_URL = "http://localhost:1234/v1/chat/completions"
@@ -31,6 +35,8 @@ conversation_state: Dict = {
     "slots_asked": set(),        # slots already asked once — never ask again
     "running_vad": None,
     "preferences_asked": False,
+    "awaiting_preferences": False,  # True while waiting for the preferences reply
+    "_was_preferences_turn": False, # True on the turn that IS the preferences reply
     "alpha": DEFAULT_ORCHESTRATOR_ALPHA,
 }
 
@@ -42,6 +48,10 @@ def reset_conversation_state():
     conversation_state["slots_asked"] = set()
     conversation_state["running_vad"] = None
     conversation_state["preferences_asked"] = False
+    conversation_state["awaiting_preferences"] = False
+    conversation_state["_was_preferences_turn"] = False
+    # Reset DST dialogue state too
+    dialogue_state.reset()
     # alpha is intentionally preserved across resets
 
 def set_alpha(alpha: float):
@@ -462,6 +472,8 @@ def reset_after_recommendation_keep_history():
     conversation_state["slot_status"] = {}
     conversation_state["slots_asked"] = set()
     conversation_state["preferences_asked"] = False
+    conversation_state["awaiting_preferences"] = False
+    conversation_state["_was_preferences_turn"] = False
 
 # ================== MAIN TURN HANDLER ==================
 async def process_turn(user_text: str, alpha: float = None) -> Dict:
@@ -472,38 +484,70 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
     if alpha is not None:
         conversation_state["alpha"] = max(0.01, min(0.99, float(alpha)))
 
-    # -------- STEP 1: EMOTION + EMA (VAD) --------
-    dst_result = process_utterance(user_text, alpha=ema_alpha)
-
-    if conversation_state["running_vad"] is None:
-        conversation_state["slots"]["Emotion"] = dst_result["mapped_emotion"]
-        conversation_state["running_vad"] = dst_result["merged"]
+    # -------- STEP 1: EMOTION + CONTEXT-AWARE VAD (DST) --------
+    # GUARD: skip VAD entirely if this turn is the user's reply to the
+    # preferences question — that reply ("No", "quiet place", etc.) carries
+    # no emotional signal and must NOT corrupt the running VAD / emotion state.
+    if conversation_state["awaiting_preferences"]:
+        # Mark preferences as consumed; VAD state is intentionally unchanged
+        conversation_state["awaiting_preferences"] = False
+        conversation_state["_was_preferences_turn"] = True
+        dst_result = None   # no VAD update this turn
     else:
-        for k in ["valence", "arousal", "dominance"]:
-            conversation_state["running_vad"][k] = (
-                ema_alpha * dst_result["merged"][k]
-                + (1 - ema_alpha) * conversation_state["running_vad"][k]
-            )
-        conversation_state["slots"]["Emotion"] = dst_result["mapped_emotion"]
+        conversation_state["_was_preferences_turn"] = False
+        # Normal turn — run the full DST pipeline
+        dst_result = process_input(user_text, dialogue_state)
+
+        if conversation_state["running_vad"] is None:
+            # First turn — accept unconditionally
+            conversation_state["slots"]["Emotion"] = dst_result["mapped_emotion"]
+            conversation_state["running_vad"] = dst_result["updated_vad"]
+        else:
+            conversation_state["running_vad"] = dst_result["updated_vad"]
+
+            # ── Emotion stability guard ──────────────────────────────────────
+            # Short / location-neutral replies like "In a hotel" or "No" have
+            # low VAD confidence and map to "shocked" or "neutral" by proximity.
+            # We must NOT let these overwrite a strong established emotion
+            # (e.g. "happy" from "I am celebrating my birthday today").
+            #
+            # Only update the emotion slot when BOTH:
+            #   1. New confidence is meaningful  (≥ 0.4)
+            #   2. Context score is low  (< 0.6) — history not strongly anchored
+            # OR the new emotion is the same as the current one (reinforcement).
+            new_emotion = dst_result["mapped_emotion"]
+            new_conf    = dst_result.get("mapped_confidence", 0.0)
+            ctx_score   = dst_result.get("context_score", 0.0)
+            cur_emotion = conversation_state["slots"].get("Emotion", "neutral")
+
+            if new_emotion == cur_emotion:
+                # Reinforcement — always accept
+                conversation_state["slots"]["Emotion"] = new_emotion
+            elif new_conf >= 0.4 and ctx_score < 0.6:
+                # Different emotion, decent signal, history not strongly anchored
+                conversation_state["slots"]["Emotion"] = new_emotion
+            # else: keep current emotion — low-confidence turn or stable history
 
     # -------- STEP 2: SLOT EXTRACTION (NO EMOTION OVERRIDE) --------
-    extracted_slots = await asyncio.to_thread(extract_slots_from_text, user_text)
-    extracted_slots.pop("Emotion", None)
+    # Skip slot extraction entirely on a preferences reply — the user is answering
+    # "do you want quiet/beach/etc?" not filling a dialogue slot.
+    # Preference keywords are extracted later from history in neo4j_recommend().
+    if not conversation_state.get("_was_preferences_turn"):
+        extracted_slots = await asyncio.to_thread(extract_slots_from_text, user_text)
+        extracted_slots.pop("Emotion", None)
 
-    # -------- STEP 2a: UNCERTAINTY CHECK ON EXTRACTED SLOTS --------
-    # If the user's reply is uncertain, mark the slot we last asked about as "unsure"
-    # so we never block on it again.
-    if is_uncertain(user_text):
-        # Mark any mandatory slot we were waiting on as unsure
-        for slot in MANDATORY_SLOTS:
-            if slot in conversation_state["slots_asked"] and slot not in conversation_state["slots"]:
-                conversation_state["slot_status"][slot] = "unsure"
-                conversation_state["slots"][slot] = "unsure"   # placeholder so it's "filled"
-    else:
-        # Normal path — accept extracted values and mark them "known"
-        for k, v in extracted_slots.items():
-            conversation_state["slots"][k] = v
-            conversation_state["slot_status"][k] = "known"
+        # -------- STEP 2a: UNCERTAINTY CHECK ON EXTRACTED SLOTS --------
+        if is_uncertain(user_text):
+            for slot in MANDATORY_SLOTS:
+                if slot in conversation_state["slots_asked"] and slot not in conversation_state["slots"]:
+                    conversation_state["slot_status"][slot] = "unsure"
+                    conversation_state["slots"][slot] = "unsure"
+        else:
+            for k, v in extracted_slots.items():
+                conversation_state["slots"][k] = v
+                conversation_state["slot_status"][k] = "known"
+    # clear the flag (it was set in the previous turn's Step 4)
+    conversation_state["_was_preferences_turn"] = False
 
     # -------- STEP 3: MANDATORY SLOT CHECK (ONE ATTEMPT PER SLOT) --------
     missing_slots = get_missing_slots(conversation_state["slots"])
@@ -523,6 +567,9 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
             "slots_collected": conversation_state["slots"],
             "slot_status": dict(conversation_state["slot_status"]),
             "running_vad": conversation_state["running_vad"],
+            "context_score": dst_result.get("context_score") if dst_result else None,
+            "effective_alpha": dst_result.get("effective_alpha") if dst_result else None,
+            "event": dst_result.get("event") if dst_result else dialogue_state.event,
         }
 
     # -------- STEP 4: ASK OPTIONAL PREFERENCES (ONCE) --------
@@ -532,14 +579,17 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
     )
     if not conversation_state["preferences_asked"] and not both_unsure:
         conversation_state["preferences_asked"] = True
+        conversation_state["awaiting_preferences"] = True   # next reply is preferences only
         return {
             "type": "preferences",
             "question": generate_preferences_question(conversation_state["slots"].get("Emotion", "neutral")),
             "slots_collected": conversation_state["slots"],
             "slot_status": dict(conversation_state["slot_status"]),
             "running_vad": conversation_state["running_vad"],
+            "context_score": dst_result.get("context_score") if dst_result else None,
+            "effective_alpha": dst_result.get("effective_alpha") if dst_result else None,
+            "event": dst_result.get("event") if dst_result else dialogue_state.event,
         }
-
     # -------- STEP 5: Neo4j Recommendations --------
     # Build effective slots — replace "unsure" placeholders with empty string
     # so the recommender falls back to pure emotion-based scoring
@@ -547,9 +597,20 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
         k: ("" if v == "unsure" else v)
         for k, v in conversation_state["slots"].items()
     }
-    recommendations = await neo4j_recommend(effective_slots)
 
-    emotion = conversation_state["slots"].get("Emotion", "stressed")
+    # Use dialogue_state.last_emotion as the authoritative emotion for
+    # recommendations. It is updated only on genuine emotional turns and is
+    # anchored by context-aware VAD history — so "In a hotel" or "No" cannot
+    # flip it away from "happy" established earlier in the conversation.
+    # Fall back to the slot emotion only if DST has no history yet.
+    stable_emotion = (
+        dialogue_state.last_emotion
+        if dialogue_state.last_emotion and dialogue_state.last_emotion != "neutral"
+        else conversation_state["slots"].get("Emotion", "stressed")
+    )
+    effective_slots["Emotion"] = stable_emotion
+    recommendations = await neo4j_recommend(effective_slots)
+    emotion = stable_emotion
 
     # -------- STEP 6: LLM Response from retrieved records --------
     # Tell the LLM which slots were unsure so it can be more empathetic
@@ -571,6 +632,9 @@ async def process_turn(user_text: str, alpha: float = None) -> Dict:
         "recommendations": recommendations,
         "reply": chat_response,
         "alpha": conversation_state["alpha"],
+        "context_score": dst_result.get("context_score") if dst_result else None,
+        "effective_alpha": dst_result.get("effective_alpha") if dst_result else None,
+        "event": dst_result.get("event") if dst_result else dialogue_state.event,
     }
 
     # -------- STEP 7: RESET FOR NEXT TRACE (KEEP HISTORY) --------

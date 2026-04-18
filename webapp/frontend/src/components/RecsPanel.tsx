@@ -10,37 +10,40 @@ export default function RecsPanel({ recs }: { recs: Recommendation[] }) {
         <p style={styles.empty}>No recommendations yet.</p>
       ) : (
         <div style={styles.list}>
-          {recs.slice(0, 3).map((r, i) => (
-            <div key={i} style={styles.rec}>
-              <div style={styles.recHeader}>
-                <span style={styles.badge}>{i + 1}</span>
-                <span style={styles.place}>{r.place}</span>
-                <span style={styles.score}>★ {r.score?.toFixed(1)}</span>
-              </div>
-              <div style={styles.area}>
-                📍 {r.area}, {r.city}
-              </div>
-              <div style={styles.activity}>🏃 {r.activity}</div>
-              {r.remedies?.length > 0 && (
-                <div style={styles.remedies}>
-                  {r.remedies.slice(0, 2).map((rem, j) => (
-                    <span key={j} style={styles.remedyTag}>
-                      {rem}
-                    </span>
-                  ))}
+          {recs.slice(0, 3).map((r, i) => {
+            const remedies = Array.isArray(r.remedies) ? r.remedies : [];
+            const why      = Array.isArray(r.why)      ? r.why      : [];
+            const score    = typeof r.score === "number" ? r.score : null;
+            return (
+              <div key={i} style={styles.rec}>
+                <div style={styles.recHeader}>
+                  <span style={styles.badge}>{i + 1}</span>
+                  <span style={styles.place}>{r.place ?? "—"}</span>
+                  {score !== null && (
+                    <span style={styles.score}>★ {score.toFixed(1)}</span>
+                  )}
                 </div>
-              )}
-              {r.why?.length > 0 && (
-                <div style={styles.why}>
-                  {r.why.slice(0, 2).map((w, j) => (
-                    <div key={j} style={styles.whyItem}>
-                      ✓ {w}
-                    </div>
-                  ))}
+                <div style={styles.area}>
+                  📍 {r.area ?? "—"}, {r.city ?? "—"}
                 </div>
-              )}
-            </div>
-          ))}
+                <div style={styles.activity}>🏃 {r.activity ?? "—"}</div>
+                {remedies.length > 0 && (
+                  <div style={styles.remedies}>
+                    {remedies.slice(0, 2).map((rem, j) => (
+                      <span key={j} style={styles.remedyTag}>{rem}</span>
+                    ))}
+                  </div>
+                )}
+                {why.length > 0 && (
+                  <div style={styles.why}>
+                    {why.slice(0, 2).map((w, j) => (
+                      <div key={j} style={styles.whyItem}>✓ {w}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
